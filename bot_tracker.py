@@ -8,6 +8,7 @@ TELEGRAM_TOKEN = "8538685611:AAFdtX2yn_dhwCB7q1l4zZu8ALohjEqKGIA"
 CHAT_ID = "2095107561"
 SOLANA_RPC = "https://api.mainnet-beta.solana.com"
 WALLETS_FILE = "wallets.json"
+STATS_FILE = "stats.json"
 
 BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
@@ -15,19 +16,41 @@ BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 RAYDIUM_AMM = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
 PUMP_FUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 
-def load_wallets():
-    if os.path.exists(WALLETS_FILE):
-        with open(WALLETS_FILE, "r") as f:
-            return json.load(f)
-    return ["675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"]
+def load_json(filename, default_val):
+    if os.path.exists(filename):
+        with open(filename, "r") as f:
+            try:
+                return json.load(f)
+            except json.JSONDecodeError:
+                return default_val
+    return default_val
 
-def save_wallets(wallets):
-    with open(WALLETS_FILE, "w") as f:
-        json.dump(wallets, f, indent=4)
+def save_json(filename, data):
+    with open(filename, "w") as f:
+        json.dump(data, f, indent=4)
 
-tracked_wallets = load_wallets()
+tracked_wallets = load_load_wallets = load_json(WALLETS_FILE, ["675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"])
+# Fix helper definition reference
+tracked_wallets = load_json(WALLETS_FILE, ["675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"])
+
+# Initialize stats structure
+default_stats = {
+    "total_trades": 0,
+    "total_buys": 0,
+    "total_sells": 0,
+    "total_sol_volume": 0.0,
+    "dex_breakdown": {"Raydium ⚡": 0, "Pump.fun 💊": 0, "Unknown DEX": 0}
+}
+stats = load_json(STATS_FILE, default_stats)
+
 seen_signatures = set()
 last_update_id = 0
+
+def save_wallets(wallets):
+    save_json(WALLETS_FILE, wallets)
+
+def save_stats():
+    save_json(STATS_FILE, stats)
 
 def send_telegram_alert(message):
     url = f"{BASE_URL}/sendMessage"
@@ -36,10 +59,9 @@ def send_telegram_alert(message):
         res = requests.post(url, json=payload, timeout=15)
         res.raise_for_status()
     except Exception as e:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Telegram send error: {e}")
+        print(f"[{datetime.now().strftime('%H:%M:%S' )}] Telegram send error: {e}")
 
 def parse_transaction_details(signature):
-    """Fetch parsed transaction details from Solana RPC to identify swap activity."""
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -57,7 +79,6 @@ def parse_transaction_details(signature):
         if not tx_data:
             return None
 
-        # Check program execution logs/accounts for DEX identification
         account_keys = [
             acc.get("pubkey") if isinstance(acc, dict) else acc 
             for acc in tx_data.get("transaction", {}).get("message", {}).get("accountKeys", [])
@@ -69,7 +90,6 @@ def parse_transaction_details(signature):
         elif RAYDIUM_AMM in account_keys:
             dex = "Raydium ⚡"
 
-        # Calculate net SOL change for fee payer
         meta = tx_data.get("meta", {})
         pre_balances = meta.get("preBalances", [])
         post_balances = meta.get("postBalances", [])
@@ -77,7 +97,6 @@ def parse_transaction_details(signature):
         if pre_balances and post_balances:
             sol_change = (post_balances[0] - pre_balances[0]) / 1e9
 
-        # Identify token balance changes
         post_token_balances = meta.get("postTokenBalances", [])
         token_mint = "SOL / Token"
         for token_info in post_token_balances:
@@ -151,11 +170,30 @@ def handle_commands():
                     send_telegram_alert(f"📋 *Tracked Wallets ({len(tracked_wallets)}):*\n\n{wallet_list}")
                 else:
                     send_telegram_alert("📋 *No wallets currently tracked.*")
+
+            elif text == "/stats":
+                raydium_count = stats["dex_breakdown"].get("Raydium ⚡", 0)
+                pump_count = stats["dex_breakdown"].get("Pump.fun 💊", 0)
+                unknown_count = stats["dex_breakdown"].get("Unknown DEX", 0)
+                
+                stats_msg = (
+                    f"📊 *SOLANA TRACKER ANALYTICS*\n\n"
+                    f"• *Total Trades Captured*: `{stats['total_trades']}`\n"
+                    f"• *Total Buys*: `{stats['total_buys']} 🟢`\n"
+                    f"• *Total Sells*: `{stats['total_sells']} 🔴`\n"
+                    f"• *Total SOL Volume*: `{round(stats['total_sol_volume'], 2)} SOL`\n\n"
+                    f"*DEX Distribution*:\n"
+                    f"  - Raydium: `{raydium_count}`\n"
+                    f"  - Pump.fun: `{pump_count}`\n"
+                    f"  - Other/Unknown: `{unknown_count}`"
+                )
+                send_telegram_alert(stats_msg)
                     
     except Exception as e:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Network retry on command check: {e}")
 
 def check_wallet_activity():
+    global stats
     headers = {"Content-Type": "application/json"}
     
     for wallet in tracked_wallets:
@@ -177,10 +215,26 @@ def check_wallet_activity():
                     status = "❌ Failed" if tx.get("err") else "✅ Success"
                     slot = tx.get("slot")
                     
-                    # Parse detailed swap data
                     details = parse_transaction_details(sig)
                     
                     if details:
+                        # Update analytics counters
+                        stats["total_trades"] += 1
+                        if "BUY" in details["trade_type"]:
+                            stats["total_buys"] += 1
+                        elif "SELL" in details["trade_type"]:
+                            stats["total_sells"] += 1
+                        
+                        stats["total_sol_volume"] += details["sol_amount"]
+                        
+                        dex_key = details["dex"]
+                        if dex_key in stats["dex_breakdown"]:
+                            stats["dex_breakdown"][dex_key] += 1
+                        else:
+                            stats["dex_breakdown"]["Unknown DEX"] += 1
+                            
+                        save_stats()
+
                         msg = (
                             f"🚨 *WHALE {details['trade_type']} DETECTED*\n\n"
                             f"• *Platform*: `{details['dex']}`\n"
@@ -204,8 +258,8 @@ def check_wallet_activity():
             print(f"[{datetime.now().strftime('%H:%M:%S')}] Solana RPC retry for {wallet[:6]}: {e}")
 
 if __name__ == "__main__":
-    print("Starting Advanced Solana DEX Tracker Engine...")
-    send_telegram_alert("⚡ *DEX Swap Parser & Wallet Tracker Active.*\n\nCommands:\n• `/add <address>`\n• `/remove <address>`\n• `/list`")
+    print("Starting Advanced Solana DEX Tracker with Analytics...")
+    send_telegram_alert("⚡ *Analytics Engine Active.*\n\nNew Commands:\n• `/stats` - View aggregate trading metrics\n• `/add` / `/remove` / `/list`")
     
     while True:
         try:

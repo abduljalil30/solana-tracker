@@ -1,0 +1,11 @@
+{
+    "total_trades": 60,
+    "total_buys": 49,
+    "total_sells": 11,
+    "total_sol_volume": 4.5020999999999995,
+    "dex_breakdown": {
+        "Raydium \u26a1": 31,
+        "Pump.fun \ud83d\udc8a": 19,
+        "Unknown DEX": 10
+    }
+}
