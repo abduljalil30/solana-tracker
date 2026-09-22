@@ -47,10 +47,9 @@ def load_stats_file():
                 pass
     return default_stats
 
+# Structure: { "chat_id": { "wallet_address": "last_known_signature" } }
 user_wallets = load_wallets_file()
 stats = load_stats_file()
-
-seen_signatures = set()
 last_update_id = 0
 
 def save_wallets():
@@ -70,25 +69,24 @@ def send_telegram_alert(chat_id, message):
     except Exception as e:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Telegram send error to {chat_id}: {e}")
 
-def silent_sync_wallet(wallet):
-    """Fetches the latest signatures for a newly added wallet and marks them as seen to avoid old alerts."""
+def get_latest_signature(wallet):
+    """Fetches the absolute latest signature for a wallet to use as a baseline."""
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
         "method": "getSignaturesForAddress",
-        "params": [wallet, {"limit": 5}]
+        "params": [wallet, {"limit": 1}]
     }
     headers = {"Content-Type": "application/json"}
     try:
         res = requests.post(SOLANA_RPC, json=payload, headers=headers, timeout=15)
         res.raise_for_status()
         signatures = res.json().get("result", [])
-        for tx in signatures:
-            sig = tx.get("signature")
-            if sig:
-                seen_signatures.add(sig)
+        if signatures:
+            return signatures[0].get("signature")
     except Exception as e:
-        print(f"Error syncing historical signatures for {wallet}: {e}")
+        print(f"Error fetching latest signature for {wallet}: {e}")
+    return None
 
 def parse_transaction_details(signature):
     payload = {
@@ -169,19 +167,26 @@ def handle_commands():
                 continue
                 
             if chat_id not in user_wallets:
-                user_wallets[chat_id] = []
+                user_wallets[chat_id] = {}
+                
+            # Backward compatibility check if user_wallets[chat_id] is a list
+            if isinstance(user_wallets[chat_id], list):
+                old_list = user_wallets[chat_id]
+                user_wallets[chat_id] = {}
+                for w in old_list:
+                    user_wallets[chat_id][w] = get_latest_signature(w)
+                save_wallets()
                 
             if text.startswith("/add"):
                 parts = text.split()
                 if len(parts) > 1:
                     new_wallet = parts[1]
                     if new_wallet not in user_wallets[chat_id]:
-                        # Silent pre-sync so past transactions don't trigger alerts
-                        silent_sync_wallet(new_wallet)
-                        
-                        user_wallets[chat_id].append(new_wallet)
+                        # Get latest sig so we ignore historical trades
+                        latest_sig = get_latest_signature(new_wallet)
+                        user_wallets[chat_id][new_wallet] = latest_sig
                         save_wallets()
-                        send_telegram_alert(chat_id, f"✅ *Added Wallet & Synced:* `{new_wallet[:6]}...{new_wallet[-4:]}`\n_You will only receive alerts for future trades._")
+                        send_telegram_alert(chat_id, f"✅ *Added Wallet & Synced:* `{new_wallet[:6]}...{new_wallet[-4:]}`\n_Watching for future trades only._")
                     else:
                         send_telegram_alert(chat_id, "⚠️ *Wallet is already in your tracking list.*")
                 else:
@@ -192,7 +197,7 @@ def handle_commands():
                 if len(parts) > 1:
                     target = parts[1]
                     if target in user_wallets[chat_id]:
-                        user_wallets[chat_id].remove(target)
+                        del user_wallets[chat_id][target]
                         save_wallets()
                         send_telegram_alert(chat_id, f"🗑 *Removed Wallet:* `{target[:6]}...{target[-4:]}`")
                     else:
@@ -203,7 +208,7 @@ def handle_commands():
             elif text == "/list":
                 my_wallets = user_wallets[chat_id]
                 if my_wallets:
-                    wallet_list = "\n".join([f"• `{w[:6]}...{w[-4:]}`" for w in my_wallets])
+                    wallet_list = "\n".join([f"• `{w[:6]}...{w[-4:]}`" for w in my_wallets.keys()])
                     send_telegram_alert(chat_id, f"📋 *Your Tracked Wallets ({len(my_wallets)}):*\n\n{wallet_list}")
                 else:
                     send_telegram_alert(chat_id, "📋 *You have no wallets currently tracked.*\nUse `/add <address>` to add one.")
@@ -230,36 +235,62 @@ def handle_commands():
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Network retry on command check: {e}")
 
 def check_wallet_activity():
-    global stats
+    global stats, user_wallets
     headers = {"Content-Type": "application/json"}
     
-    wallet_to_users = {}
-    for chat_id, wallets in user_wallets.items():
-        for wallet in wallets:
-            if wallet not in wallet_to_users:
-                wallet_to_users[wallet] = []
-            wallet_to_users[wallet].append(chat_id)
+    # Flatten unique wallets and map which chat_ids track them
+    wallet_to_chats = {}
+    for chat_id, wallets_dict in user_wallets.items():
+        if isinstance(wallets_dict, dict):
+            for wallet in wallets_dict.keys():
+                if wallet not in wallet_to_chats:
+                    wallet_to_chats[wallet] = []
+                wallet_to_chats[wallet].append(chat_id)
             
-    unique_wallets = list(wallet_to_users.keys())
-    if not unique_wallets:
+    if not wallet_to_chats:
         return
 
-    for wallet in unique_wallets:
+    for wallet, chat_ids in wallet_to_chats.items():
         payload = {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "getSignaturesForAddress",
-            "params": [wallet, {"limit": 2}]
+            "params": [wallet, {"limit": 5}]
         }
         try:
             res = requests.post(SOLANA_RPC, json=payload, headers=headers, timeout=15)
             res.raise_for_status()
             signatures = res.json().get("result", [])
+            if not signatures:
+                continue
+                
+            # Sort signatures from oldest to newest
+            signatures = list(reversed(signatures))
             
-            for tx in reversed(signatures):
-                sig = tx.get("signature")
-                if sig not in seen_signatures:
-                    seen_signatures.add(sig)
+            for chat_id in chat_ids:
+                last_seen_sig = user_wallets.get(chat_id, {}).get(wallet)
+                new_signatures_to_process = []
+                found_marker = (last_seen_sig is None)
+                
+                for tx in signatures:
+                    sig = tx.get("signature")
+                    if not found_marker:
+                        if sig == last_seen_sig:
+                            found_marker = True
+                        continue
+                    else:
+                        # If we passed the marker (or there was no prior marker), this is a new tx
+                        if sig != last_seen_sig:
+                            new_signatures_to_process.append(tx)
+                
+                # Update user's last seen signature to the absolute newest one available
+                newest_sig = signatures[-1].get("signature")
+                if newest_sig and chat_id in user_wallets and wallet in user_wallets[chat_id]:
+                    user_wallets[chat_id][wallet] = newest_sig
+                    save_wallets()
+
+                for tx in new_signatures_to_process:
+                    sig = tx.get("signature")
                     status = "❌ Failed" if tx.get("err") else "✅ Success"
                     slot = tx.get("slot")
                     
@@ -300,15 +331,13 @@ def check_wallet_activity():
                             f"• *Explorer*: [View on Solscan](https://solscan.io/tx/{sig})"
                         )
                         
-                    target_chats = wallet_to_users.get(wallet, [])
-                    for chat_id in target_chats:
-                        send_telegram_alert(chat_id, msg)
+                    send_telegram_alert(chat_id, msg)
                     
         except Exception as e:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] Solana RPC retry for {wallet[:6]}: {e}")
 
 if __name__ == "__main__":
-    print("Starting Multi-User Isolated Solana DEX Tracker with Silent Sync...")
+    print("Starting Multi-User Solana Tracker with Persistent State Sync...")
     while True:
         try:
             handle_commands()
