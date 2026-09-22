@@ -11,6 +11,10 @@ WALLETS_FILE = "wallets.json"
 
 BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
+# Known DEX Program IDs
+RAYDIUM_AMM = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+PUMP_FUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+
 def load_wallets():
     if os.path.exists(WALLETS_FILE):
         with open(WALLETS_FILE, "r") as f:
@@ -27,17 +31,77 @@ last_update_id = 0
 
 def send_telegram_alert(message):
     url = f"{BASE_URL}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}
+    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown", "disable_web_page_preview": True}
     try:
         res = requests.post(url, json=payload, timeout=15)
         res.raise_for_status()
     except Exception as e:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Telegram send timeout/error: {e}")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Telegram send error: {e}")
+
+def parse_transaction_details(signature):
+    """Fetch parsed transaction details from Solana RPC to identify swap activity."""
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getTransaction",
+        "params": [
+            signature,
+            {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
+        ]
+    }
+    headers = {"Content-Type": "application/json"}
+    try:
+        res = requests.post(SOLANA_RPC, json=payload, headers=headers, timeout=15)
+        res.raise_for_status()
+        tx_data = res.json().get("result")
+        if not tx_data:
+            return None
+
+        # Check program execution logs/accounts for DEX identification
+        account_keys = [
+            acc.get("pubkey") if isinstance(acc, dict) else acc 
+            for acc in tx_data.get("transaction", {}).get("message", {}).get("accountKeys", [])
+        ]
+        
+        dex = "Unknown DEX"
+        if PUMP_FUN_PROGRAM in account_keys:
+            dex = "Pump.fun 💊"
+        elif RAYDIUM_AMM in account_keys:
+            dex = "Raydium ⚡"
+
+        # Calculate net SOL change for fee payer
+        meta = tx_data.get("meta", {})
+        pre_balances = meta.get("preBalances", [])
+        post_balances = meta.get("postBalances", [])
+        sol_change = 0
+        if pre_balances and post_balances:
+            sol_change = (post_balances[0] - pre_balances[0]) / 1e9
+
+        # Identify token balance changes
+        post_token_balances = meta.get("postTokenBalances", [])
+        token_mint = "SOL / Token"
+        for token_info in post_token_balances:
+            mint = token_info.get("mint")
+            if mint and mint != "So11111111111111111111111111111111111111112":
+                token_mint = mint
+                break
+
+        trade_type = "BUY 🟢" if sol_change < 0 else "SELL 🔴" if sol_change > 0 else "SWAP 🔄"
+        
+        return {
+            "dex": dex,
+            "trade_type": trade_type,
+            "sol_amount": abs(round(sol_change, 4)),
+            "token_mint": token_mint
+        }
+    except Exception as e:
+        print(f"Error parsing transaction {signature[:8]}: {e}")
+        return None
 
 def handle_commands():
     global last_update_id, tracked_wallets
     url = f"{BASE_URL}/getUpdates"
-    params = {"offset": last_update_id + 1, "timeout": 5}
+    params = {"offset": last_update_id + 1, "timeout": 2}
     
     try:
         res = requests.get(url, params=params, timeout=10)
@@ -113,21 +177,35 @@ def check_wallet_activity():
                     status = "❌ Failed" if tx.get("err") else "✅ Success"
                     slot = tx.get("slot")
                     
-                    msg = (
-                        f"🚨 *SMART MONEY ACTIVITY DETECTED*\n\n"
-                        f"• *Wallet*: `{wallet[:6]}...{wallet[-4:]}`\n"
-                        f"• *Status*: {status}\n"
-                        f"• *Slot*: `{slot}`\n"
-                        f"• *Explorer*: [View on Solscan](https://solscan.io/tx/{sig})"
-                    )
+                    # Parse detailed swap data
+                    details = parse_transaction_details(sig)
+                    
+                    if details:
+                        msg = (
+                            f"🚨 *WHALE {details['trade_type']} DETECTED*\n\n"
+                            f"• *Platform*: `{details['dex']}`\n"
+                            f"• *Wallet*: `{wallet[:6]}...{wallet[-4:]}`\n"
+                            f"• *Amount*: `{details['sol_amount']} SOL`\n"
+                            f"• *Token Mint*: `{details['token_mint']}`\n"
+                            f"• *Status*: {status}\n"
+                            f"• *Links*: [Solscan](https://solscan.io/tx/{sig}) | [DexScreener](https://dexscreener.com/solana/{details['token_mint']})"
+                        )
+                    else:
+                        msg = (
+                            f"🚨 *SMART MONEY ACTIVITY DETECTED*\n\n"
+                            f"• *Wallet*: `{wallet[:6]}...{wallet[-4:]}`\n"
+                            f"• *Status*: {status}\n"
+                            f"• *Slot*: `{slot}`\n"
+                            f"• *Explorer*: [View on Solscan](https://solscan.io/tx/{sig})"
+                        )
                     send_telegram_alert(msg)
                     
         except Exception as e:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] Solana RPC retry for {wallet[:6]}: {e}")
 
 if __name__ == "__main__":
-    print("Starting Interactive Solana Tracker Engine...")
-    send_telegram_alert("⚡ *Interactive Solana Tracker Online.*\n\nCommands:\n• `/add <address>`\n• `/remove <address>`\n• `/list`")
+    print("Starting Advanced Solana DEX Tracker Engine...")
+    send_telegram_alert("⚡ *DEX Swap Parser & Wallet Tracker Active.*\n\nCommands:\n• `/add <address>`\n• `/remove <address>`\n• `/list`")
     
     while True:
         try:
