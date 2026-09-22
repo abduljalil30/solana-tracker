@@ -1,6 +1,5 @@
 .env
+__pycache__/
+*.log
 wallets.json
 stats.json
-tracker.log
-__pycache__/
-venv/
